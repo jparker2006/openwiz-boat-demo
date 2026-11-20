@@ -35,7 +35,7 @@ HERE=$(cd "$(dirname "$0")" && pwd) || exit 1
 FLEET=${FLEET_SH:-$HERE/fleet.sh}
 FIX=$HERE/fixtures
 NOW=1793534400 # 2026-11-01T12:00:00Z, the fixtures' "now"
-CASES=815      # main's 783 cases, #2788's three snapshot regressions, #641's 27 record-author cases, E8's release tree and E5's private map
+CASES=841      # includes the two CW-G fresh wake cases; WS8 moved the re-check case to test-brief.py
 fails=0
 cases=0
 ERR=''         # the exact stderr the next case expects, when not the points line
@@ -115,6 +115,10 @@ def pr_say($n; $id; $h; $body): pull($n; .comments += [{id: $id, at: at($h), bod
 def by($n; $id; $h; $who; $body): issue($n; .comments += [{id: $id, at: at($h), author: $who, body: $body}]);
 def pr_by($n; $id; $h; $who; $body): pull($n; .comments += [{id: $id, at: at($h), author: $who, body: $body}]);
 def outsider: "synthetic-outsider";
+# KN13 (#1448): the ready-for-agent label of #$n put on at $h by $who (a login, or null
+# for GitHub'"'"'s deleted user), and its body last edited at $h by $who.
+def labelled($n; $h; $who): issue($n; .labelEvents += [{name: "ready-for-agent", at: at($h), by: $who}]);
+def body_edited($n; $h; $who): issue($n; .editedAt = at($h) | .editor = $who);
 # Each check carries the time its workflow run was created ($run): when GitHub
 # fixed the merge commit it tests (K9, #337; a re-run keeps it).
 def green: [{name: "build", status: "COMPLETED", conclusion: "SUCCESS", run: at("11:00")},
@@ -130,7 +134,7 @@ def merged_pr($n; $t; $h; $files): .pulls += [{number: $n, state: "MERGED", draf
 def changed($f; $s): {filename: $f, status: $s};
 def ticket($n; $title; $labels; $blockers): .issues += [{number: $n, title: $title, state: "OPEN",
   parent: 10, labels: $labels, blockedBy: $blockers, body: "", comments: []}];
-# A plan-graph approval comment on SPEC, as plan-graph writes it: the graph
+# A to-tickets approval comment on SPEC, as to-tickets writes it: the graph
 # read back now, one row per ticket; a row is a number (ready-for-agent) or
 # [number, label].
 def row_of($n; $lbl): .issues[] | select(.number == $n)
@@ -184,8 +188,8 @@ bad() { echo "FAIL $1: $2"; fails=$((fails + 1)); }
 # world FIXTURE FILTER DIR: the fixture changed by FILTER, on stdout. FILTER
 # is "BEFORE @@then@@ AFTER", or just BEFORE. BEFORE makes the world as the
 # user approved it: then each spec's "@@FP@@" becomes its fingerprint, from
-# plan-graph's revision.sh (the copy in fixtures/) run on that world, as
-# plan-graph records it. AFTER changes it since. The frontier fixture takes its
+# to-tickets’ revision.sh (the copy in fixtures/) run on that world, as
+# to-tickets records it. AFTER changes it since. The frontier fixture takes its
 # settings files from check.json. DIR holds the steps.
 world() {
   before=${2%%@@then@@*}
@@ -380,7 +384,7 @@ take() {
 
 # only_reads LOG...: every gh call in these logs was one of fleet.sh's reads.
 only_reads() {
-  grep -h -v -E '^(repo view|nightly runs branch=[^ ]+|commit comments [0-9a-f]{40}|contents docs/agents/(fleet|triage-labels)\.md|graphql (Specs|Merged) cursor=[0-9a-z]+|graphql Spec number=[0-9]+( size=[0-9]+)?|graphql Singles cursor=[0-9a-z]+|files [0-9]+|refs heads/room/[0-9]+-|graphql (Nodes|Blockers) count=[0-9]+|graphql Checks oid=[0-9a-f]{40} cursor=[0-9]+|graphql Item number=[0-9]+ size=(2|5)( cursor=[0-9]+)?|issue view [0-9]+ (subIssues|body|number,title,blockedBy)|issues page=[0-9]+|search issues page=[0-9]+|issue comments [0-9]+ page=[0-9]+|detail [0-9]+|dependencies [0-9]+ page=[0-9]+|repo clone|repository|user|installation repositories|sub issues [0-9]+ page=[0-9]+|timeline [0-9]+ page=[0-9]+|(check runs|status) [0-9a-f]{40}|ref heads/[A-Za-z0-9._/-]+)$' "$@" 2> /dev/null \
+  grep -h -v -E '^(repo view|nightly runs branch=[^ ]+|commit comments [0-9a-f]{40}|contents docs/agents/(fleet|triage-labels)\.md|graphql (Specs|Merged) cursor=[0-9a-z]+|graphql Spec number=[0-9]+( size=[0-9]+)?|graphql Singles cursor=[0-9a-z]+|files [0-9]+|refs heads/room/[0-9]+-|graphql (Nodes|Blockers) count=[0-9]+|graphql Writer login=[a-z0-9-]+|graphql Checks oid=[0-9a-f]{40} cursor=[0-9]+|graphql Item number=[0-9]+ size=(2|5)( cursor=[0-9]+)?|issue view [0-9]+ (subIssues|body|number,title,blockedBy)|issues page=[0-9]+|search issues page=[0-9]+|issue comments [0-9]+ page=[0-9]+|detail [0-9]+|dependencies [0-9]+ page=[0-9]+|repo clone|repository|user|installation repositories|sub issues [0-9]+ page=[0-9]+|timeline [0-9]+ page=[0-9]+|(check runs|status) [0-9a-f]{40}|ref heads/[A-Za-z0-9._/-]+)$' "$@" 2> /dev/null \
     | sed 's/^/    /' > "$tmp/odd-calls"
   if [ -s "$tmp/odd-calls" ]; then bad 'only reads' "unexpected gh calls:"; cat "$tmp/odd-calls"; else echo "ok   every gh call was one of fleet.sh's reads"; fi
 }
@@ -587,6 +591,83 @@ log_has 'GH_REPO unset: the repository comes from the clone' 1 '^repo view$'
 expect 'a merge unlocks the ticket waiting on it' 0 check.json 'merge12' -- check <<EOF
 start #13: W3: widget page (spec #10)
 EOF
+### KN13 (#1448): a start needs ready-for-agent from a maintainer and no edit since
+
+expect 'KN13: labelled by a record author, unedited: starts as before' 0 check.json 'merge12 | labelled(13; "09:00"; "Synthetic-Owner")' -- check <<EOF
+start #13: W3: widget page (spec #10)
+EOF
+log_has 'KN13: labelled by a record author, unedited: starts as before' 0 '^graphql Writer'
+expect 'KN13: labelled by the App, which GraphQL names without [bot]: starts' 0 check.json 'merge12 | labelled(13; "09:00"; "synthetic-factory[bot]")' -- check <<EOF
+start #13: W3: widget page (spec #10)
+EOF
+expect 'KN13: edited before a maintainer labelled it: starts' 0 check.json 'merge12 | body_edited(13; "08:30"; outsider) | labelled(13; "09:00"; "Synthetic-Owner")' -- check <<EOF
+start #13: W3: widget page (spec #10)
+EOF
+expect 'KN13: labelled by a non-maintainer: refused, once, naming who must re-approve' 0 check.json 'merge12 | labelled(13; "09:00"; outsider)' -- check <<EOF
+look #13: start refused: ready-for-agent was last added at 2026-11-01T09:00:00Z by someone who is not a maintainer; a maintainer must add it again
+EOF
+again 'KN13: the refusal recorded, nothing more' 'say(13; 1301; "11:58"; "launch-fleet: look: start refused: ready-for-agent was last added at 2026-11-01T09:00:00Z by someone who is not a maintainer; a maintainer must add it again")' -- check < /dev/null
+again 'KN13: a maintainer adds it again: starts' 'labelled(13; "11:59"; "Synthetic-Owner")' -- check <<EOF
+start #13: W3: widget page (spec #10)
+EOF
+expect 'KN13: labelled by a deleted user: refused' 0 check.json 'merge12 | labelled(13; "09:00"; null)' -- check <<EOF
+look #13: start refused: ready-for-agent was last added at 2026-11-01T09:00:00Z by someone who is not a maintainer; a maintainer must add it again
+EOF
+expect 'KN13: labelled by an App that is not a record author: refused' 0 check.json 'merge12 | labelled(13; "09:00"; "other-app[bot]")' -- check <<EOF
+look #13: start refused: ready-for-agent was last added at 2026-11-01T09:00:00Z by someone who is not a maintainer; a maintainer must add it again
+EOF
+log_has 'KN13: labelled by an App that is not a record author: refused' 0 '^graphql Writer'
+expect 'KN13: the newest labelling counts: a maintainer, then a non-maintainer' 0 check.json 'merge12 | labelled(13; "09:00"; "Synthetic-Owner") | labelled(13; "10:00"; outsider)' -- check <<EOF
+look #13: start refused: ready-for-agent was last added at 2026-11-01T10:00:00Z by someone who is not a maintainer; a maintainer must add it again
+EOF
+expect 'KN13: labelled by a collaborator with write access: starts' 0 check.json 'merge12 | labelled(13; "09:00"; "synthetic-writer") | .collaborators = {"synthetic-writer": "WRITE"}' -- check <<EOF
+start #13: W3: widget page (spec #10)
+EOF
+log_has 'KN13: labelled by a collaborator with write access: starts' 1 '^graphql Writer login=synthetic-writer$'
+expect 'KN13: labelled by a collaborator with triage access only: refused' 0 check.json 'merge12 | labelled(13; "09:00"; "synthetic-writer") | .collaborators = {"synthetic-writer": "TRIAGE"}' -- check <<EOF
+look #13: start refused: ready-for-agent was last added at 2026-11-01T09:00:00Z by someone who is not a maintainer; a maintainer must add it again
+EOF
+expect 'KN13: write access only for a longer login it matches: refused' 0 check.json 'merge12 | labelled(13; "09:00"; "synthetic-writer") | .collaborators = {"synthetic-writer-2": "ADMIN"}' -- check <<EOF
+look #13: start refused: ready-for-agent was last added at 2026-11-01T09:00:00Z by someone who is not a maintainer; a maintainer must add it again
+EOF
+expect 'KN13: an unreadable collaborator answer fails closed' 0 check.json 'merge12 | labelled(13; "09:00"; "synthetic-writer") | .collaborators = {"synthetic-writer": "WRITE"}' FAKE_GH_ERRORS=Writer -- check <<EOF
+look #13: start refused: ready-for-agent was last added at 2026-11-01T09:00:00Z by someone who is not a maintainer; a maintainer must add it again
+EOF
+expect 'KN13: a blocked ticket labelled by an outsider asks nothing' 0 check.json 'labelled(13; "09:00"; "synthetic-writer")' -- check < /dev/null
+log_has 'KN13: a blocked ticket labelled by an outsider asks nothing' 0 '^graphql Writer'
+expect 'KN13: edited by someone else after labelling: refused' 0 check.json 'merge12 | labelled(13; "09:00"; "Synthetic-Owner") | body_edited(13; "10:00"; outsider)' -- check <<EOF
+look #13: start refused: the ticket was edited at 2026-11-01T10:00:00Z, after ready-for-agent was added at 2026-11-01T09:00:00Z; a maintainer must add it again
+EOF
+again 'KN13: a maintainer adds it again after the edit: starts' 'labelled(13; "11:00"; "Synthetic-Owner")' -- check <<EOF
+start #13: W3: widget page (spec #10)
+EOF
+expect 'KN13: any edit after labelling refuses, a maintainer'"'"'s too' 0 check.json 'merge12 | labelled(13; "09:00"; "Synthetic-Owner") | body_edited(13; "10:00"; "Synthetic-Owner")' -- check <<EOF
+look #13: start refused: the ticket was edited at 2026-11-01T10:00:00Z, after ready-for-agent was added at 2026-11-01T09:00:00Z; a maintainer must add it again
+EOF
+expect 'KN13: the ready label pushed out of the last 20 label events: refused' 0 check.json 'merge12 | labelled(13; "09:00"; "Synthetic-Owner") | issue(13; .labelEvents += [range(10; 30) | {name: "bug", at: "2026-11-01T10:\(.):00Z"}])' -- check <<EOF
+look #13: start refused: who added ready-for-agent can't be read; a maintainer must add it again
+EOF
+expect 'KN13: the frontier leaves a refused ticket out' 0 check.json 'merge12 | labelled(13; "09:00"; outsider)' -- frontier < /dev/null
+expect 'KN13: a wake on a refused ticket refuses it too' 0 check.json 'merge12 | labelled(13; "09:00"; "Synthetic-Owner") | body_edited(13; "10:00"; outsider)' -- wake 13 <<EOF
+look #13: start refused: the ticket was edited at 2026-11-01T10:00:00Z, after ready-for-agent was added at 2026-11-01T09:00:00Z; a maintainer must add it again
+EOF
+expect 'KN13: a claim on a ticket edited since labelling withdraws' 0 check.json 'merge12 | labelled(13; "09:00"; "Synthetic-Owner") | body_edited(13; "10:00"; outsider) | say(13; 1301; "11:55"; "launch-fleet: starting")' -- claim 13 1301 <<EOF
+withdraw #13: start refused: the ticket was edited at 2026-11-01T10:00:00Z, after ready-for-agent was added at 2026-11-01T09:00:00Z; a maintainer must add it again
+EOF
+expect 'KN13: a claim on a ticket labelled by a non-maintainer withdraws' 0 check.json 'merge12 | labelled(13; "09:00"; outsider) | say(13; 1301; "11:55"; "launch-fleet: starting")' -- claim 13 1301 <<EOF
+withdraw #13: start refused: ready-for-agent was last added at 2026-11-01T09:00:00Z by someone who is not a maintainer; a maintainer must add it again
+EOF
+expect 'KN13: an issue approved on its own needs a maintainer'"'"'s label too' 0 check.json 'own_approval(70; 7001; "10:00") | labelled(70; "09:00"; outsider)' -- check <<EOF
+look #70: start refused: ready-for-agent was last added at 2026-11-01T09:00:00Z by someone who is not a maintainer; a maintainer must add it again
+EOF
+
+expect 'KN13 R1: edited the same second as the label on an issue approved on its own: refused' 0 check.json 'own_approval(70; 7001; "10:00") | labelled(70; "09:00"; "Synthetic-Owner") | body_edited(70; "09:00"; outsider)' -- check <<EOF
+look #70: start refused: the ticket was edited at 2026-11-01T09:00:00Z, the same second ready-for-agent was added, so which came first can't be read; a maintainer must add it again
+EOF
+expect 'KN13 R1: a claim on an issue edited the same second as its label withdraws' 0 check.json 'own_approval(70; 7001; "10:00") | labelled(70; "09:00"; "Synthetic-Owner") | body_edited(70; "09:00"; outsider) | say(70; 7002; "11:55"; "launch-fleet: starting")' -- claim 70 7002 <<EOF
+withdraw #70: start refused: the ticket was edited at 2026-11-01T09:00:00Z, the same second ready-for-agent was added, so which came first can't be read; a maintainer must add it again
+EOF
+
 expect 'a claimed start is left alone for 10 minutes' 0 check.json 'merge12 | say(13; 1301; "11:55"; "launch-fleet: starting")' -- check < /dev/null
 expect 'a claim with no outcome after 10 minutes is reconciled' 0 check.json 'merge12 | say(13; 1301; "11:45"; "launch-fleet: starting")' -- check <<EOF
 reconcile start #13: claimed at 2026-11-01T11:45:00Z, no outcome after 10 minutes
@@ -1181,59 +1262,53 @@ expect 'needs-info: a new question after the last one was asked' 0 check.json 'i
 needs-info #12: a question for the orchestrator
 EOF
 
-### The contract hold (holds, and the same lines in the check)
+### Contract changes and existing holds
 
 # #565: historical plan-graph headings, on synthetic ticket bodies only.
-expect 'legacy Relies on: holds unstarted tickets and notes builders' 0 check.json 'issue(12; .body = "## Relies on\n\n`contracts/widget.v1.md`\n\n## Proof\nSynthetic proof.") | issue(13; .body = "## Relies on\n\n`contracts/widget.v1.md`\n\n## Acceptance criteria\nSynthetic criterion.") | contract23' -- holds <<EOF
+expect 'legacy Relies on: notes builders without holding unstarted tickets' 0 check.json 'issue(12; .body = "## Relies on\n\n`contracts/widget.v1.md`\n\n## Proof\nSynthetic proof.") | issue(13; .body = "## Relies on\n\n`contracts/widget.v1.md`\n\n## Acceptance criteria\nSynthetic criterion.") | contract23' -- holds <<EOF
 note #12: contracts/widget.v1.md changed in #23; tell its builder, thread thr_syn12
-hold #13: contracts/widget.v1.md changed in #23
 EOF
-expect 'legacy Relies on: check holds a ready ticket instead of starting it' 0 check.json 'merge12 | issue(13; .body = "## Relies on\n\n`contracts/widget.v1.md`\n") | contract23' -- check <<EOF
-hold #13: contracts/widget.v1.md changed in #23
+expect 'legacy Relies on: check starts the ready ticket after a contract change' 0 check.json 'merge12 | issue(13; .body = "## Relies on\n\n`contracts/widget.v1.md`\n") | contract23' -- check <<EOF
+start #13: W3: widget page (spec #10)
 EOF
-expect 'legacy Relies on: a targeted wake sees the contract hold' 0 check.json 'merge12 | issue(13; .body = "## Relies on\n\n`contracts/widget.v1.md`\n") | contract23' -- wake 13 <<EOF
-hold #13: contracts/widget.v1.md changed in #23
+expect 'legacy Relies on: a targeted wake starts the ready ticket' 0 check.json 'merge12 | issue(13; .body = "## Relies on\n\n`contracts/widget.v1.md`\n") | contract23' -- wake 13 <<EOF
+start #13: W3: widget page (spec #10)
 EOF
-expect 'legacy Relies on: every file across lines and CRLF is read' 0 check.json 'issue(13; .body = "## Relies on\r\n\r\n- `contracts/widget.v1.md`\r\n- `contracts/other.v1.md`, `contracts/widget.v1.md`\r\n\r\n## Proof\r\n`contracts/unrelated.v1.md`") | m23([changed("contracts/widget.v1.md"; "modified"), changed("contracts/other.v1.md"; "modified"), changed("contracts/unrelated.v1.md"; "modified")])' -- holds <<EOF
+expect 'legacy Relies on: every file across lines and CRLF is read' 0 check.json 'issue(13; .body = "## Relies on\r\n\r\n- `contracts/widget.v1.md`\r\n- `contracts/other.v1.md`, `contracts/widget.v1.md`\r\n\r\n## Proof\r\n`contracts/unrelated.v1.md`") | m23([changed("contracts/widget.v1.md"; "modified"), changed("contracts/other.v1.md"; "modified"), changed("contracts/unrelated.v1.md"; "modified")]) | say(13; 1301; "10:50"; "launch-fleet: start checked, thread thr_syn13, branch room/13-widget-cccc")' -- holds <<EOF
 note #12: contracts/widget.v1.md changed in #23; tell its builder, thread thr_syn12
-hold #13: contracts/other.v1.md, contracts/widget.v1.md changed in #23
+note #13: contracts/other.v1.md, contracts/widget.v1.md changed in #23; tell its builder, thread thr_syn13
 EOF
 expect 'legacy Relies on: unrelated sections and similar headings add no contracts' 0 check.json 'issue(12; .body = "## Owned paths\n`contracts/widget.v1.md`\n\n## Relies on elsewhere\n`contracts/widget.v1.md`\n\n## Relies on\n\nnothing\n\n## Proof\n`contracts/widget.v1.md`") | issue(13; .body = "## Relies on\n\nnothing\n\n### Proof\n`contracts/widget.v1.md`") | contract23' -- holds < /dev/null
-expect 'legacy Relies on: inline and heading declarations both protect contracts' 0 check.json 'issue(13; .body = "**Relies on:** `contracts/other.v1.md`\n\n## Relies on\n\n`contracts/widget.v1.md`\n") | m23([changed("contracts/widget.v1.md"; "modified"), changed("contracts/other.v1.md"; "modified")])' -- holds <<EOF
+expect 'legacy Relies on: inline and heading declarations both inform builders' 0 check.json 'issue(13; .body = "**Relies on:** `contracts/other.v1.md`\n\n## Relies on\n\n`contracts/widget.v1.md`\n") | m23([changed("contracts/widget.v1.md"; "modified"), changed("contracts/other.v1.md"; "modified")]) | say(13; 1301; "10:50"; "launch-fleet: start checked, thread thr_syn13, branch room/13-widget-cccc")' -- holds <<EOF
 note #12: contracts/widget.v1.md changed in #23; tell its builder, thread thr_syn12
-hold #13: contracts/other.v1.md, contracts/widget.v1.md changed in #23
+note #13: contracts/other.v1.md, contracts/widget.v1.md changed in #23; tell its builder, thread thr_syn13
 EOF
 
-expect 'a changed contract holds the unstarted ticket and notes the building one' 0 check.json 'contract23' -- holds <<EOF
+expect 'a changed contract only notes the building ticket' 0 check.json 'contract23' -- holds <<EOF
 note #12: contracts/widget.v1.md changed in #23; tell its builder, thread thr_syn12
-hold #13: contracts/widget.v1.md changed in #23
 EOF
-expect 'the check prints the same hold and note' 0 check.json 'contract23' -- check <<EOF
+expect 'the check prints the same note without a hold' 0 check.json 'contract23' -- check <<EOF
 note #12: contracts/widget.v1.md changed in #23; tell its builder, thread thr_syn12
-hold #13: contracts/widget.v1.md changed in #23
 EOF
 expect 'creating a contract is not changing it' 0 check.json 'm23([changed("contracts/widget.v1.md"; "added")])' -- holds < /dev/null
 expect 'a merge before the approval does not count' 0 check.json 'merged_pr(23; 99; "07:00"; [changed("contracts/widget.v1.md"; "modified")])' -- holds < /dev/null
-expect 'a merge before a ticket'"'"'s own approval does not count, though it is after another'"'"'s' 0 check.json 'issue(70; .body = "**Relies on:** `contracts/widget.v1.md`") | own_approval(70; 7002; "11:00") | contract23' -- holds <<EOF
+expect 'a merge before a ticket'"'"'s own approval does not count, though it is after another'"'"'s' 0 check.json 'issue(70; .body = "**Relies on:** `contracts/widget.v1.md`") | own_approval(70; 7002; "11:00") | say(70; 7003; "11:15"; "launch-fleet: start checked, thread thr_syn70, branch room/70-fix-eeee") | contract23' -- holds <<EOF
 note #12: contracts/widget.v1.md changed in #23; tell its builder, thread thr_syn12
-hold #13: contracts/widget.v1.md changed in #23
 EOF
 expect 'a merge into another branch does not count' 0 check.json 'contract23 | pull(23; .base = "release-1")' -- holds < /dev/null
 expect 'a merge before the latest approval does not count' 0 check.json 'contract23 | approve(10; 1002; "11:00"; 2; [11, 12, 13, 14])' -- holds < /dev/null
-expect 'a hold or note already recorded is not repeated' 0 check.json 'contract23 | say(13; 1301; "10:30"; "launch-fleet: held for #23") | say(12; 1202; "10:30"; "launch-fleet: noted #23")' -- holds < /dev/null
-expect 'a folder and a pattern under Relies on' 0 check.json 'm23([changed("docs/widgets/guide.md"; "modified"), changed("skills/grill/SKILL.md"; "modified"), changed("skills/grill/agents/openai.yaml"; "modified"), changed("docs/other.md"; "modified")])' -- holds <<EOF
-hold #13: docs/widgets/guide.md, skills/grill/SKILL.md changed in #23
+expect 'a past hold or note prevents a duplicate builder note' 0 check.json 'contract23 | say(13; 1302; "10:30"; "launch-fleet: held for #23") | say(12; 1202; "10:30"; "launch-fleet: noted #23") | say(13; 1301; "10:00"; "launch-fleet: start checked, thread thr_syn13, branch room/13-widget-cccc")' -- holds < /dev/null
+expect 'a folder and a pattern under Relies on' 0 check.json 'm23([changed("docs/widgets/guide.md"; "modified"), changed("skills/grill/SKILL.md"; "modified"), changed("skills/grill/agents/openai.yaml"; "modified"), changed("docs/other.md"; "modified")]) | say(13; 1301; "10:50"; "launch-fleet: start checked, thread thr_syn13, branch room/13-widget-cccc")' -- holds <<EOF
+note #13: docs/widgets/guide.md, skills/grill/SKILL.md changed in #23; tell its builder, thread thr_syn13
 EOF
 expect 'a contract renamed away is a change' 0 check.json 'm23([{filename: "contracts/widget.v2.md", status: "renamed", previous_filename: "contracts/widget.v1.md"}])' -- holds <<EOF
 note #12: contracts/widget.v1.md changed in #23; tell its builder, thread thr_syn12
-hold #13: contracts/widget.v1.md changed in #23
 EOF
 expect 'a contract removed is a change' 0 check.json 'm23([changed("contracts/widget.v1.md"; "removed")])' -- holds <<EOF
 note #12: contracts/widget.v1.md changed in #23; tell its builder, thread thr_syn12
-hold #13: contracts/widget.v1.md changed in #23
 EOF
-expect 'a ready ticket with a hold due is held, not started' 0 check.json 'merge12 | contract23' -- check <<EOF
-hold #13: contracts/widget.v1.md changed in #23
+expect 'a ready ticket starts after a relied-on contract change' 0 check.json 'merge12 | contract23' -- check <<EOF
+start #13: W3: widget page (spec #10)
 EOF
 expect 'a held ticket does not start, even with its label still on' 0 check.json 'merge12 | contract23 | say(13; 1301; "11:10"; "launch-fleet: held for #23")' -- check < /dev/null
 expect 'a held label stops a start; with no hold of launch-fleet'"'"'s behind it, it is left on' 0 check.json 'merge12 | issue(13; .labels += ["held"])' -- check < /dev/null
@@ -1252,10 +1327,10 @@ EOF
 expect 'a held ticket starts once a new revision approves it' 0 check.json 'merge12 | contract23 | say(13; 1301; "11:10"; "launch-fleet: held for #23") | approve(10; 1002; "11:20"; 2; [11, 12, 13, 14])' -- check <<EOF
 start #13: W3: widget page (spec #10)
 EOF
-expect 'merged pull requests read across pages, files cached' 0 check.json 'contract23 | merged_pr(24; 98; "10:30"; [changed("README.md"; "modified")]) | merged_pr(25; 97; "10:40"; [changed("docs/widgets/a.md"; "modified"), changed("docs/widgets/b.md"; "modified"), changed("docs/widgets/c.md"; "added")])' FAKE_GH_PAGE=1 -- holds <<EOF
+expect 'merged pull requests read across pages, files cached' 0 check.json 'contract23 | merged_pr(24; 98; "10:30"; [changed("README.md"; "modified")]) | merged_pr(25; 97; "10:40"; [changed("docs/widgets/a.md"; "modified"), changed("docs/widgets/b.md"; "modified"), changed("docs/widgets/c.md"; "added")]) | say(13; 1301; "10:50"; "launch-fleet: start checked, thread thr_syn13, branch room/13-widget-cccc")' FAKE_GH_PAGE=1 -- holds <<EOF
 note #12: contracts/widget.v1.md changed in #23; tell its builder, thread thr_syn12
-hold #13: contracts/widget.v1.md changed in #23
-hold #13: docs/widgets/a.md, docs/widgets/b.md changed in #25
+note #13: contracts/widget.v1.md changed in #23; tell its builder, thread thr_syn13
+note #13: docs/widgets/a.md, docs/widgets/b.md changed in #25; tell its builder, thread thr_syn13
 EOF
 log_has 'merged pull requests read across pages' 4 '^graphql Merged'
 log_has 'merged pull requests read across pages' 3 '^files 25$'
@@ -1273,7 +1348,7 @@ fi
 ### The loop's script: a clone of the project in the loop's sandbox
 
 # A synthetic project on disk, as `gh repo clone` and `git fetch` find it: this
-# fleet.sh, and plan-graph's revision.sh where the plan-graph skill keeps it.
+# fleet.sh, and to-tickets’ revision.sh where the to-tickets skill keeps it.
 loop_case() { # NAME, then the checks; $1 is the case's name
   cases=$((cases + 1))
   echo "ok   $1"
@@ -1281,9 +1356,9 @@ loop_case() { # NAME, then the checks; $1 is the case's name
 L=$tmp/loop
 if { [ -n "${TEST_ONLY:-}" ] && [ "$TEST_ONLY" != loop ]; } || ! take; then
   : # the loop's script runs only in a full run, in one worker
-elif mkdir -p "$L/remote/skills/launch-fleet/scripts" "$L/remote/skills/plan-graph" "$L/home" \
+elif mkdir -p "$L/remote/skills/launch-fleet/scripts" "$L/remote/skills/to-tickets" "$L/home" \
   && cp "$FLEET" "$L/remote/skills/launch-fleet/scripts/fleet.sh" \
-    && cp "$HERE/records.py" "$L/remote/skills/launch-fleet/scripts/records.py" && cp "$FIX/revision.sh" "$L/remote/skills/plan-graph/revision.sh" \
+    && cp "$HERE/records.py" "$L/remote/skills/launch-fleet/scripts/records.py" && cp "$FIX/revision.sh" "$L/remote/skills/to-tickets/revision.sh" \
   && git -C "$L/remote" init -q && git -C "$L/remote" add -A \
   && git -C "$L/remote" -c user.name=synthetic -c user.email=synthetic@example.invalid commit -q -m one \
   && mkdir "$L/w" && world check.json 'merge12' "$L/w" > "$L/world.json"; then
@@ -1300,7 +1375,7 @@ elif mkdir -p "$L/remote/skills/launch-fleet/scripts" "$L/remote/skills/plan-gra
   printf 'start #13: W3: widget page (spec #10)\n' > "$L/want"
   if loop_run log1 out1 && cmp -s "$L/want" "$L/out1" && loop_points "$L/out1.err" && grep -qx 'repo clone' "$L/log1" \
     && grep -q '^issue view 10 subIssues$' "$L/log1"; then
-    loop_case "the loop's script clones the project and runs its check, with plan-graph's revision.sh beside it"
+    loop_case "the loop's script clones the project and runs its check, with to-tickets’ revision.sh beside it"
   else
     bad "the loop's script clones the project and runs its check" "$(cat "$L/out1" "$L/out1.err" | head -c 400)"; cases=$((cases + 1))
   fi
@@ -1403,8 +1478,8 @@ EOF
 
 ### A person's ticket under a changed contract
 
-expect 'a person'"'"'s ticket whose contract changed is held, not announced (Sol R3)' 0 check.json 'merge12 | issue(13; .labels = ["ready-for-human"]) | approve(10; 1002; "09:50"; 2; [11, 12, [13, "ready-for-human"], 14]) | contract23' -- check <<EOF
-hold #13: contracts/widget.v1.md changed in #23
+expect 'a person'"'"'s ticket is announced after a contract change' 0 check.json 'merge12 | issue(13; .labels = ["ready-for-human"]) | approve(10; 1002; "09:50"; 2; [11, 12, [13, "ready-for-human"], 14]) | contract23' -- check <<EOF
+person #13: W3: widget page (spec #10) is ready, and only the user can do it
 EOF
 expect 'a held person'"'"'s ticket stays quiet until approved again' 0 check.json 'merge12 | issue(13; .labels = ["held"]) | approve(10; 1002; "09:50"; 2; [11, 12, [13, "ready-for-human"], 14]) | contract23 | say(13; 1301; "10:30"; "launch-fleet: held for #23: contract changed, re-approve.")' -- check < /dev/null
 expect 'a person'"'"'s ticket approved again since its hold is released before it is announced' 0 check.json 'merge12 | issue(13; .labels = ["held", "ready-for-human"]) | approve(10; 1002; "09:50"; 2; [11, 12, [13, "ready-for-human"], 14]) | contract23 | held_at(13; "10:29") | say(13; 1301; "10:30"; "launch-fleet: held for #23: contract changed, re-approve.") | approve(10; 1003; "11:20"; 3; [11, 12, [13, "ready-for-human"], 14])' -- check <<EOF
@@ -1492,7 +1567,6 @@ review #32 for #70 at $(sha 32): first review
 EOF
 expect 'a held issue approved on its own starts once approved again' 0 check.json 'issue(70; .body = "**Relies on:** `contracts/widget.v1.md`") | own_approval(70; 7002; "09:00") | contract23 | say(70; 7003; "10:30"; "launch-fleet: held for #23") | own_approval(70; 7004; "11:00")' -- check <<EOF
 note #12: contracts/widget.v1.md changed in #23; tell its builder, thread thr_syn12
-hold #13: contracts/widget.v1.md changed in #23
 start #70: Fix the broken link in the widget docs (approved on its own)
 EOF
 expect 'a closed issue approved on its own gets its builder archived' 0 check.json 'say(70; 7002; "09:00"; "**Approved on its own by Robin, 2026-11-01:** \"approve #70\"") | say(70; 7003; "09:10"; "launch-fleet: start checked, thread thr_syn70, branch room/70-fix-eeee") | issue(70; .state = "CLOSED")' -- check <<EOF
@@ -1777,10 +1851,10 @@ expect 'a failed read of the branches' 2 check.json 'merge12 | say(13; 1301; "11
 can't read the branches of #13
 EOF
 expect 'revision.sh fails: nothing starts, and the check fails' 2 check.json 'merge12' FAKE_GH_FAIL=issue_view_13_body -- check <<EOF
-plan-graph's revision.sh failed on #10
+to-tickets’ revision.sh failed on #10
 EOF
 expect 'revision.sh missing when a ticket could start: the check fails' 2 check.json 'merge12' LAUNCH_FLEET_REVISION=/nonexistent/revision.sh -- frontier <<EOF
-can't find plan-graph's revision.sh
+can't find to-tickets’ revision.sh
 EOF
 expect 'no jq' 2 check.json . PATH="$tmp/nojq" -- check <<EOF
 jq is not installed
@@ -2056,7 +2130,8 @@ expect 'a low finding added after the approval starts once a new revision covers
 #55 G11: gadget filter
 #57 G13: a low finding, filed after the approval
 EOF
-expect 'a contract hold due stops a start' 0 frontier.json 'issue(41; .body = "**Relies on:** `contracts/gadget.v1.md`") | merged_pr(75; 98; "10:00"; [changed("contracts/gadget.v1.md"; "modified")])' -- frontier <<EOF
+expect 'a relied-on contract change leaves a ticket on the frontier' 0 frontier.json 'issue(41; .body = "**Relies on:** `contracts/gadget.v1.md`") | merged_pr(75; 98; "10:00"; [changed("contracts/gadget.v1.md"; "modified")])' -- frontier <<EOF
+#41 G1: gadget reader
 #45 G5: gadget import
 #55 G11: gadget filter
 EOF
@@ -2436,8 +2511,8 @@ expect 'stall: an unknown reopen reason is not an automatic retry' 0 check.json 
 expect 'wake: an approved head merges' 0 check.json 'reviewing31 | pr_say(31; 3102; "11:40"; "VERDICT: APPROVE at \(sha(31))")' -- wake 31 <<EOF
 merge #31 for #12 at $S31: APPROVE and CI green
 EOF
-expect 'wake: a changed contract holds the ticket it names, which never starts' 0 check.json 'merge12 | contract23' -- wake 13 <<EOF
-hold #13: contracts/widget.v1.md changed in #23
+expect 'wake: a relied-on contract change leaves the ticket ready to start' 0 check.json 'merge12 | contract23' -- wake 13 <<EOF
+start #13: W3: widget page (spec #10)
 EOF
 
 # A refusal's record is itself a message: a refused start or review is tried
@@ -2983,6 +3058,25 @@ EOF
 
 # A builder's own fleet thread reaches it; one from before the fleet thread is taken over.
 FINDINGS31='pr31 | pr_say(31; 3101; "11:10"; "launch-fleet: review started \(sha(31)), thread thr_synrev31") | pr_say(31; 3102; "11:20"; "VERDICT: CHANGES at \(sha(31))")'
+# CW-G: independent processes with cold caches share only the durable routing
+# and GitHub fixtures. The first wake must keep the recorded builder, then the
+# next must honour the delivery record without taking over or sending again.
+if selected 'CW-G: route findings to the existing builder' || selected 'CW-G: resume from the recorded delivery'; then
+  printf '%s\n' '{"repo":"synthetic-owner/synthetic-repo","threads":{"builder:12":"thr_syn12","review:31:claim:3101":"thr_synrev31"}}' > "$tmp/fresh-routes.json" || exit 1
+fi
+FRESH_FINDINGS="pr31 | .private = false
+  | edit(12; 1201; \"09:40\"; \"launch-fleet: start checked, branch room/12-w2-widget-store-bbbb\")
+  | pr_say(31; 3101; \"09:41\"; \"launch-fleet: review started \(sha(31))\")
+  | say(10; 1090; \"10:00\"; \"launch-fleet: fleet active, loop fleet-10\\n\\nWake mode: fresh\")
+  | pr_say(31; 3102; \"11:20\"; \"VERDICT: CHANGES at \(sha(31))\")"
+expect 'CW-G: route findings to the existing builder' 0 check.json "$FRESH_FINDINGS" \
+  LAUNCH_FLEET_STATE="$tmp/fresh-routes.json" -- spec 10 <<EOF
+findings #31 for #12 at $S31: tell its builder, thread thr_syn12
+EOF
+expect 'CW-G: resume from the recorded delivery' 0 check.json \
+  "$FRESH_FINDINGS | pr_say(31; 3103; \"11:21\"; \"launch-fleet: findings sent \(sha(31))\")" \
+  LAUNCH_FLEET_STATE="$tmp/fresh-routes.json" -- spec 10 < /dev/null
+
 expect 'fleet: without a fleet thread, findings go to the recorded builder' 0 check.json "$FINDINGS31" -- spec 10 <<EOF
 findings #31 for #12 at $S31: tell its builder, thread thr_syn12
 EOF
@@ -3091,17 +3185,14 @@ expect 'takeover R3: a takeover claim with no outcome 10 minutes after its edit 
 reconcile start #12: claimed at 2026-11-01T11:45:00Z, no outcome after 10 minutes
 EOF
 
-# Sol's re-check of #1517 at 6277bb77 (R4): a contract change on a ticket whose
-# builder is out of the fleet thread's reach is a hold, not a lost note.
-expect "takeover R4: a contract change before the old builder's archive is a hold" 0 check.json "$FINDINGS31 | $FLEET10 | issue(13; .body = \"\") | contract23" -- spec 10 <<EOF
-hold #12: contracts/widget.v1.md changed in #23
+expect "takeover: a contract change before archive leaves the archive request due" 0 check.json "$FINDINGS31 | $FLEET10 | issue(13; .body = \"\") | contract23" -- spec 10 <<EOF
 look #12: archive thread [private thread]: its builder, started before fleet thread [private thread]
 EOF
-expect "takeover R4: a contract change after the old builder's archive is a hold, and starts nothing" 0 check.json "$ARCH12 | issue(13; .body = \"\") | contract23" -- spec 10 <<EOF
-hold #12: contracts/widget.v1.md changed in #23
+expect "takeover: a contract change after archive allows a replacement builder" 0 check.json "$ARCH12 | issue(13; .body = \"\") | contract23" -- spec 10 <<EOF
+take over #12: builder thread thr_syn12 is archived; start a builder to continue branch room/12-w2-widget-store-bbbb (its record: comment 1201)
 EOF
-expect 'takeover R4: a contract change on a takeover retry with its pull request open is a hold' 0 check.json "$ARCH12 | issue(13; .body = \"\") | contract23 | edit(12; 1201; \"11:45\"; \"launch-fleet: start refused: synthetic reason\")" -- spec 10 <<EOF
-hold #12: contracts/widget.v1.md changed in #23
+expect 'takeover: a contract change does not block a retry with the pull request open' 0 check.json "$ARCH12 | issue(13; .body = \"\") | contract23 | edit(12; 1201; \"11:45\"; \"launch-fleet: start refused: synthetic reason\")" -- spec 10 <<EOF
+take over #12: builder thread thr_syn12 is archived; start a builder to continue branch room/12-w2-widget-store-bbbb (its record: comment 1201; retry after "start refused: synthetic reason")
 EOF
 expect 'takeover R4: once held, a takeover waits for the new approval' 0 check.json "$ARCH12 | issue(13; .body = \"\") | contract23 | issue(12; .labels = [\"held\"]) | say(12; 1295; \"11:50\"; \"launch-fleet: held for #23: contract changed, re-approve. contracts/widget.v1.md changed in #23.\")" -- spec 10 < /dev/null
 
@@ -3111,9 +3202,9 @@ if { [ -n "${TEST_ONLY:-}" ] && [ "$TEST_ONLY" != fleet-loop ]; } || ! take; the
   : # the fleet thread's loop runs only in a full run, in one worker
 else
   FL=$tmp/case-fleetloop
-  if mkdir -p "$FL/remote/skills/launch-fleet/scripts" "$FL/remote/skills/plan-graph" "$FL/home" "$FL/w" \
+  if mkdir -p "$FL/remote/skills/launch-fleet/scripts" "$FL/remote/skills/to-tickets" "$FL/home" "$FL/w" \
     && cp "$FLEET" "$FL/remote/skills/launch-fleet/scripts/fleet.sh" \
-    && cp "$HERE/records.py" "$FL/remote/skills/launch-fleet/scripts/records.py" && cp "$FIX/revision.sh" "$FL/remote/skills/plan-graph/revision.sh" \
+    && cp "$HERE/records.py" "$FL/remote/skills/launch-fleet/scripts/records.py" && cp "$FIX/revision.sh" "$FL/remote/skills/to-tickets/revision.sh" \
     && git -C "$FL/remote" init -q && git -C "$FL/remote" add -A \
     && git -C "$FL/remote" -c user.name=synthetic -c user.email=synthetic@example.invalid commit -q -m one \
     && world check.json "merge12 | $SPEC40" "$FL/w" > "$FL/world.json"; then
@@ -3209,17 +3300,20 @@ EOF
 ### Token cuts (#694) in the skill: no superseded base-moved text, ticks end,
 ### re-checks carry their delta, one probe per batch, keyed scope blockers
 
-# skill_has NAME TEXT / skill_lacks NAME REGEX: one case on SKILL.md beside this folder.
-SKILL=$HERE/../SKILL.md
+# skill_has NAME TEXT / skill_lacks NAME REGEX: one case on the skill's text beside this folder,
+# SKILL.md and its references (WS8 moved branch detail there, #1181).
+SKILL="$HERE/../SKILL.md $HERE/../references/*.md"
 skill_has() {
   [ -z "${TEST_ONLY:-}" ] || [ "$1" = "$TEST_ONLY" ] || return 0
   cases=$((cases + 1))
-  if grep -qF -- "$2" "$SKILL"; then echo "ok   $1"; else bad "$1" "SKILL.md lacks: $2"; fi
+  # shellcheck disable=SC2086 # the list is the skill's own files
+  if cat $SKILL | grep -qF -- "$2"; then echo "ok   $1"; else bad "$1" "SKILL.md lacks: $2"; fi
 }
 skill_lacks() {
   [ -z "${TEST_ONLY:-}" ] || [ "$1" = "$TEST_ONLY" ] || return 0
   cases=$((cases + 1))
-  if grep -qiE -- "$2" "$SKILL"; then bad "$1" "SKILL.md still has: $(grep -iE -- "$2" "$SKILL" | head -n 1)"; else echo "ok   $1"; fi
+  # shellcheck disable=SC2086
+  if cat $SKILL | grep -qiE -- "$2"; then bad "$1" "SKILL.md still has: $(cat $SKILL | grep -iE -- "$2" | head -n 1)"; else echo "ok   $1"; fi
 }
 if take; then
   skill_lacks 'skill: no superseded base-moved merge text' 'base moved'
@@ -3227,7 +3321,7 @@ if take; then
   skill_has 'skill: the brief carries no merge rule' 'The brief is only the prompt above'
   skill_has 'skill: a tick archives itself once its records are written' 'once every record and message is written, archive your own thread'
   skill_lacks 'skill: a tick never stays open for the user' 'leave it open with a one-line verdict'
-  skill_has 'skill: a re-check names its finding ids, both heads and what changed' 'Open findings: <the ids>. Changed since <old head>: git diff <old head> <commit>; the builder'"'"'s answer: <its comment link>.'
+  # The re-check message's ids, both heads and delta: test-brief.py's re-check case (WS8).
   skill_has 'skill: one probe per batch, by assignment' 'start that group'"'"'s first claim alone, the probe'
   skill_has 'skill: the start not tried record' '`start not tried: <why>`'
   skill_has 'skill: a scope blocker is raised once per key' '`look #N: blocked on scope <key>: ...`'
@@ -3268,8 +3362,8 @@ re-approve #10: changed since revision 1 (fingerprint now $ORDER_STALE_FP)
 EOF_ORDER
 expect 'ordering: manual hold cannot be inferred from a closed blocker' 0 check.json 'merge12 | issue(13; .labels = ["held"]) | held_at(13; "11:09") | say(13; 1301; "11:10"; "Orchestrator: manual hold until I approve.")' -- check < /dev/null
 expect 'ordering: contract hold still needs reapproval' 0 check.json "$ORDER13 | $ORDER71 | say(13; 1302; \"11:20\"; \"launch-fleet: held for #72: contract changed, re-approve.\")" -- check < /dev/null
-expect 'ordering: due contract change prevents release' 0 check.json "$ORDER13 | $ORDER71 | contract23" -- check <<EOF_ORDER
-hold #13: contracts/widget.v1.md changed in #23
+expect 'ordering: a contract change does not prevent an ordering release' 0 check.json "$ORDER13 | $ORDER71 | contract23" -- check <<EOF_ORDER
+release #13: ordering hold 1301; issue #71 merged to main; restore ready-for-agent and remove held
 EOF_ORDER
 expect 'ordering: production live hold is not an ordering record' 0 check.json "$ORDER13 | $ORDER71 | edit(13; 1301; \"11:10\"; \"launch-fleet: held for production/live: wait for #71\")" -- check < /dev/null
 expect 'ordering: new manual label ownership defeats older ordering evidence' 0 check.json "$ORDER13 | $ORDER71 | held_at(13; \"11:40\")" -- check < /dev/null
@@ -3382,20 +3476,20 @@ OB7CLAIM='say(13; 1303; "11:55"; "launch-fleet: release starting 1301")'
 expect 'OB7: an answered contract hold with nothing newer is released' 0 check.json "$OB7" -- check <<EOF
 release #13: approved again since its hold; take the held label off
 EOF
-expect 'OB7: a contract merge after the approval holds instead of releasing' 0 check.json "$OB7 | $OB7LATE" -- check <<EOF
-hold #13: contracts/widget.v1.md changed in #26
+expect 'OB7: a later contract merge does not block release' 0 check.json "$OB7 | $OB7LATE" -- check <<EOF
+release #13: approved again since its hold; take the held label off
 EOF
-expect 'OB7: a wake holds instead of releasing past a later contract merge' 0 check.json "$OB7 | $OB7LATE" -- wake 13 <<EOF
-hold #13: contracts/widget.v1.md changed in #26
+expect 'OB7: a wake releases the existing hold after a later merge' 0 check.json "$OB7 | $OB7LATE" -- wake 13 <<EOF
+release #13: approved again since its hold; take the held label off
 EOF
-expect 'OB7: a renamed contract after the approval holds instead of releasing' 0 check.json "$OB7 | merged_pr(26; 99; \"11:45\"; [{filename: \"contracts/widget.v2.md\", status: \"renamed\", previous_filename: \"contracts/widget.v1.md\"}])" -- check <<EOF
-hold #13: contracts/widget.v1.md changed in #26
+expect 'OB7: a renamed contract does not block release' 0 check.json "$OB7 | merged_pr(26; 99; \"11:45\"; [{filename: \"contracts/widget.v2.md\", status: \"renamed\", previous_filename: \"contracts/widget.v1.md\"}])" -- check <<EOF
+release #13: approved again since its hold; take the held label off
 EOF
-expect 'OB7: a deleted contract after the approval holds instead of releasing' 0 check.json "$OB7 | merged_pr(26; 99; \"11:45\"; [changed(\"contracts/widget.v1.md\"; \"removed\")])" -- check <<EOF
-hold #13: contracts/widget.v1.md changed in #26
+expect 'OB7: a deleted contract does not block release' 0 check.json "$OB7 | merged_pr(26; 99; \"11:45\"; [changed(\"contracts/widget.v1.md\"; \"removed\")])" -- check <<EOF
+release #13: approved again since its hold; take the held label off
 EOF
-expect 'OB7: a person'"'"'s ticket holds instead of releasing past a later contract merge' 0 check.json "$OB7 | approve(10; 1003; \"11:35\"; 3; [11, 12, [13, \"ready-for-human\"], 14]) | $OB7LATE" -- check <<EOF
-hold #13: contracts/widget.v1.md changed in #26
+expect 'OB7: a person'"'"'s ticket releases after a later contract merge' 0 check.json "$OB7 | approve(10; 1003; \"11:35\"; 3; [11, 12, [13, \"ready-for-human\"], 14]) | $OB7LATE" -- check <<EOF
+release #13: approved again since its hold; take the held label off
 EOF
 expect 'OB7: a plan changed since its approval releases nothing' 0 check.json "$OB7 @@then@@ issue(14; .blockedBy = [12])" -- check <<EOF
 re-approve #10: changed since revision 2 (fingerprint now e9f6f2a713ac)
@@ -3406,8 +3500,12 @@ withdraw #13: that ordering release is not due or an older claim holds it
 EOF
 expect 'OB7: a partial relabel under an unresolved claim starts nothing' 0 check.json "$OB7 | issue(13; .labels = [\"ready-for-agent\"]) | $OB7CLAIM" -- check < /dev/null
 expect 'OB7: a newer manual hold keeps the contract hold held' 0 check.json "$OB7 | say(13; 1302; \"11:40\"; \"launch-fleet: held manual: owner decision required\")" -- check < /dev/null
-expect 'OB7: a noted contract merge after the approval still blocks the release' 0 check.json "$OB7 | $OB7LATE | say(13; 1304; \"11:46\"; \"launch-fleet: noted #26\")" -- check < /dev/null
-expect 'OB7: a contract merge at the approval time blocks the release' 0 check.json "$OB7 | merged_pr(26; 99; \"11:30\"; [changed(\"contracts/widget.v1.md\"; \"modified\")])" -- check < /dev/null
+expect 'OB7: a noted contract merge after approval does not block release' 0 check.json "$OB7 | $OB7LATE | say(13; 1304; \"11:46\"; \"launch-fleet: noted #26\")" -- check <<EOF
+release #13: approved again since its hold; take the held label off
+EOF
+expect 'OB7: a contract merge at the approval time does not block release' 0 check.json "$OB7 | merged_pr(26; 99; \"11:30\"; [changed(\"contracts/widget.v1.md\"; \"modified\")])" -- check <<EOF
+release #13: approved again since its hold; take the held label off
+EOF
 
 # #2112 (OB7): ON1 evidence checks; the release effect stays disabled.
 if [ -z "${TEST_ONLY:-}" ] || [ "$TEST_ONLY" = on1 ]; then
@@ -3441,7 +3539,7 @@ fi
 if [ -z "${TEST_ONLY:-}" ] || [ "$TEST_ONLY" = private-map ]; then
   if take; then
     cases=$((cases + 1))
-    if python3 -I - "$HERE/../SKILL.md" "$tmp/private-map.json" > "$tmp/private-map.log" 2>&1 <<'PY' \
+    if python3 -I - "$HERE/../references/records.md" "$tmp/private-map.json" > "$tmp/private-map.log" 2>&1 <<'PY' \
       && printf '{"specs":[],"singles":[]}' | LAUNCH_FLEET_STATE="$tmp/private-map.json" \
         python3 -I "$HERE/records.py" synthetic-owner/synthetic-repo false >> "$tmp/private-map.log" 2>&1; then
 import json, re, sys
@@ -3455,7 +3553,7 @@ json.dump(state, open(sys.argv[2], 'w'))
 PY
       echo 'ok   private-map'
     else
-      bad private-map "records.py can't read the private map SKILL.md documents"
+      bad private-map "records.py can't read the private map references/records.md documents"
       cat "$tmp/private-map.log"
     fi
   fi
@@ -3467,7 +3565,7 @@ if [ -z "${TEST_ONLY:-}" ] || [ "$TEST_ONLY" = o10-release ]; then
   if take; then
     cases=$((cases + 1))
     rel=$tmp/o10-release
-    if mkdir -p "$rel/skills" && cp -R "$HERE/../../launch-fleet" "$HERE/../../triage" "$HERE/../../plan-graph" "$rel/skills/" \
+    if mkdir -p "$rel/skills" && cp -R "$HERE/../../launch-fleet" "$HERE/../../triage" "$HERE/../../to-tickets" "$rel/skills/" \
       && (cd "$rel" && GIT_CEILING_DIRECTORIES=$tmp python3 -I skills/launch-fleet/scripts/fixtures/test-o10-triage.py) > "$tmp/o10-release.log" 2>&1; then
       echo 'ok   o10-release'
     else
@@ -3477,14 +3575,14 @@ if [ -z "${TEST_ONLY:-}" ] || [ "$TEST_ONLY" = o10-release ]; then
   fi
 fi
 
-### The pinned revision.sh is plan-graph's
+### The pinned revision.sh is to-tickets’
 
 if [ -z "${TEST_ONLY:-}" ] && take; then
   cases=$((cases + 1))
-  if cmp -s "$FIX/revision.sh" "$HERE/../../plan-graph/revision.sh"; then
-    echo "ok   the pinned revision.sh is plan-graph's, byte for byte"
+  if cmp -s "$FIX/revision.sh" "$HERE/../../to-tickets/revision.sh"; then
+    echo "ok   the pinned revision.sh is to-tickets’, byte for byte"
   else
-    bad "the pinned revision.sh is plan-graph's, byte for byte" "fixtures/revision.sh differs from skills/plan-graph/revision.sh: copy it again"
+    bad "the pinned revision.sh is to-tickets’, byte for byte" "fixtures/revision.sh differs from skills/to-tickets/revision.sh: copy it again"
   fi
 fi
 
@@ -3718,6 +3816,7 @@ case ${TEST_ONLY:-} in
   'GI1:*') expected=16 ;;
   'WZ-PROBE:*') expected=3 ;;
   'GI2:*') expected=13 ;;
+  'CW-G:*') expected=2 ;;
 esac
 [ "$cases" = "$expected" ] || bad 'the selected cases ran' "$cases cases ran, not $expected: is \"$TEST_ONLY\" a case's name?"
 

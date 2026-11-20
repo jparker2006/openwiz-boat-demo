@@ -8,7 +8,7 @@
 #   sh fleet.sh frontier              every ticket that may start now: "#N title"
 #                                     (a ticket of an approved plan graph, or an
 #                                     issue approved on its own, its blockers merged)
-#   sh fleet.sh holds                 every contract hold and builder note that is due
+#   sh fleet.sh holds                 every contract change note due for a builder
 #   sh fleet.sh claim N COMMENT_ID    after a tick posts a claim on ticket or pull request N:
 #                                     "go #N" if the claim is the oldest live one and N is
 #                                     still due, else "withdraw #N: <why>"
@@ -26,8 +26,8 @@
 # in $LAUNCH_FLEET_CACHE (default ~/.cache/launch-fleet): they never change.
 # The same sandbox cache holds ETagged REST answers, revalidated on every read.
 # Before a ticket of a spec may start, the spec's latest plan graph approval
-# must be current: plan-graph's revision.sh ($LAUNCH_FLEET_REVISION, default
-# ../../plan-graph/revision.sh from this file) prints the plan as it is now,
+# must be current: to-tickets’ revision.sh ($LAUNCH_FLEET_REVISION, default
+# ../../to-tickets/revision.sh from this file) prints the plan as it is now,
 # and its SHA-256 must be the approval's fingerprint.
 # $LAUNCH_FLEET_NOW (seconds since 1970) stands in for the clock in tests.
 #
@@ -128,7 +128,7 @@ command -v jq > /dev/null 2>&1 || die "jq is not installed"
 if command -v sha256sum > /dev/null 2>&1; then SHA=sha256sum
 elif command -v shasum > /dev/null 2>&1; then SHA='shasum -a 256'
 else die "neither sha256sum nor shasum is installed"; fi
-REVISION=${LAUNCH_FLEET_REVISION:-$(cd "$(dirname "$0")" && pwd)/../../plan-graph/revision.sh}
+REVISION=${LAUNCH_FLEET_REVISION:-$(cd "$(dirname "$0")" && pwd)/../../to-tickets/revision.sh}
 
 NOW=${LAUNCH_FLEET_NOW:-$(date -u +%s)}
 is_number "$NOW" || die "LAUNCH_FLEET_NOW must be a number of seconds"
@@ -156,35 +156,9 @@ else
 fi
 RECORD=''
 
-# C10 (#2317), Assumption A1: the one switch for the shared installation read
-# route. It is on only once the installation's credentials are configured:
-# C9's protected provisioning writes <state>/service/github-reads/installation.json
-# (<state> as the carried github-app/app.py beside carried/ resolves it). Off,
-# every read below is the `gh` read it was. On, repository REST reads except
-# G7's nightly workflow go through C8's read.py (carried byte for byte in
-# carried/ beside this script) as authority reads bound to this check's start; a missing helper or
-# a missing, expired or revoked
-# installation refuses it, and it never falls back to `gh`. GraphQL, the issue
-# search and revision.sh's reads stay on `gh`: C8 cannot express them (#2317's
-# reader gaps, docs/agents/fleet.md). G6: GI1's account probe (`user`) also
-# stays on `gh`: C8 accepts only repository endpoints, not personal identity.
-# G7: nightly-workflow reads stay on `gh`, preserving the absent-workflow skip;
-# C8 refuses non-200 responses without exposing their HTTP status.
-READS_STATE=${OPENWIZ_STATE_DIR:-}
-if [ -z "$READS_STATE" ]; then
-  case ${XDG_STATE_HOME:-} in /*) READS_STATE=$XDG_STATE_HOME/openwiz ;; *) READS_STATE=$HOME/.local/state/openwiz ;; esac
-fi
-INSTALLATION=no
-if [ -e "$READS_STATE/service/github-reads/installation.json" ] || [ -L "$READS_STATE/service/github-reads/installation.json" ]; then
-  INSTALLATION=yes
-fi
-READER=$(cd "$(dirname "$0")" && pwd)/carried/read.py
-CHALLENGE=$(date +%s)
 
 REPO=${GH_REPO:-}
 if [ -z "$REPO" ]; then
-  # The installation route reads only for an explicit caller repository.
-  [ "$INSTALLATION" = no ] || die "the installation read route needs GH_REPO=owner/name"
   REPO=$(gh repo view --json nameWithOwner --jq .nameWithOwner) || die "set GH_REPO=owner/name, or run inside a clone"
 fi
 case $REPO in
@@ -209,7 +183,8 @@ case $SELF in *[!0-9a-f]* | '') CACHE='' ;; esac
 
 # The fields of a ticket, and of an issue approved on its own.
 TICKET='number
-        timelineItems(itemTypes: [LABELED_EVENT], last: 20) { nodes { ... on LabeledEvent { createdAt label { name } } } }
+        lastEditedAt editor { __typename login }
+        timelineItems(itemTypes: [LABELED_EVENT], last: 20) { nodes { ... on LabeledEvent { createdAt actor { __typename login } label { name } } } }
         closedByPullRequestsReferences(first: 5, includeClosedPrs: true) {
           pageInfo { hasNextPage }
           nodes {
@@ -315,6 +290,12 @@ query() {
         }
       }
     } }
+  }
+}' ;;
+    Writer) printf '%s\n' 'query Writer($owner: String!, $name: String!, $login: String!) {
+  rateLimit { cost remaining limit resetAt }
+  repository(owner: $owner, name: $name) {
+    collaborators(query: $login, first: 10) { edges { permission node { login } } }
   }
 }' ;;
     Merged) printf '%s\n' 'query Merged($owner: String!, $name: String!, $cursor: String) {
@@ -458,7 +439,6 @@ keep() {
 http_get() (
   endpoint=$1 destination=$2 media=${3:-application/vnd.github+json}
   # Like `gh api` without --paginate: the first page only.
-  if [ "$INSTALLATION" = yes ] && routed "$endpoint"; then installation_get "$endpoint" "$destination" "$media" single; exit; fi
   request=$(printf '%s\n' 'launch-fleet REST v1' "${GH_HOST:-github.com}" "$endpoint" "$media" | hash) || exit 1
   entry=$CACHE/rest-$request.json
   work=$(mktemp -d "$TMP/rest.XXXXXX") && rm -f "$destination.304" || exit 1
@@ -535,83 +515,15 @@ http_status() {
 http_etag() { awk 'tolower($1) == "etag:" { sub(/^[^:]*:[ ]*/, ""); sub(/\r$/, ""); print; exit }' "$1"; }
 http_body() { awk 'body { print } /^\r?$/ { body=1 }' "$1"; }
 
-# routed ENDPOINT: an endpoint the installation route reads (C8 accepts only
-# repos/<REPO>/), except G7, or a later page of one it already read.
-routed() {
-  case $1 in
-    "repos/$REPO/actions/workflows/"*) return 1 ;; # G7: keep HTTP-status outcomes
-    "repos/$REPO" | "repos/$REPO/"* | installation-page:*) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-# installation_get ENDPOINT DESTINATION MEDIA [single]: one read through C8's
-# read.py, as an HTTP response for the parsers above: status 200, no cache
-# headers, and the body of its first page. C8 follows and checks every page
-# itself; each later page is kept in this check's temporary folder, and its
-# response names it as the next page (installation-page:FILE). A refusal or
-# deferral prints read.py's one line of fixed words and fails the read.
-installation_get() (
-  endpoint=$1 destination=$2 media=$3 single_page=${4:-}
-  case $endpoint in installation-page:*)
-    page=${endpoint#installation-page:}
-    case $page in "$TMP"/installation.*/http.[0-9]*) ;; *) exit 1 ;; esac
-    case $page in *..* | *[!A-Za-z0-9._/-]*) exit 1 ;; esac
-    cp "$page" "$destination"
-    exit
-  esac
-  [ -f "$READER" ] || { printf 'fleet.sh: installation read refused: the read helper is missing\n' >&2; exit 1; }
-  work=$(mktemp -d "$TMP/installation.XXXXXX") || exit 1
-  set -- rest "$REPO" "$endpoint" --accept "$media" --purpose authority --max-age 60 --challenge "$CHALLENGE"
-  [ "$single_page" != single ] || set -- "$@" --single-page
-  if ! python3 -I "$READER" "$@" > "$work/body" 2> "$work/error" < /dev/null; then
-    line=$(head -n 1 "$work/error" | LC_ALL=C grep -E '^(refused|deferred): [a-z-]+( until=[0-9]+)?$') || line='failed'
-    printf 'fleet.sh: installation read %s\n' "$line" >&2
-    exit 1
-  fi
-  if [ "$media" = application/vnd.github.raw+json ]; then
-    cp "$work/body" "$work/page.1" || exit 1
-  else
-    # One file per page body, exactly as read.py printed it.
-    python3 -I -c 'import json, sys
-text, at, n = open(sys.argv[1], encoding="utf-8").read(), 0, 0
-decoder = json.JSONDecoder()
-while text[at:].strip():
-    start = len(text) - len(text[at:].lstrip())
-    _, at = decoder.raw_decode(text, start)
-    n += 1
-    open("%s/page.%d" % (sys.argv[2], n), "w", encoding="utf-8").write(text[start:at] + "\n")
-if not n:
-    sys.exit(1)' "$work/body" "$work" || exit 1
-  fi
-  n=1
-  while [ -f "$work/page.$n" ]; do
-    next=$((n + 1))
-    { printf 'HTTP/1.1 200 OK\r\n'
-      [ ! -f "$work/page.$next" ] || printf 'X-OpenWiz-Next: installation-page:%s\r\n' "$work/http.$next"
-      printf '\r\n'
-      cat "$work/page.$n"; } > "$work/http.$n" || exit 1
-    n=$next
-  done
-  cp "$work/http.1" "$destination"
-)
 rest() (
   media=${3:-application/vnd.github+json}
-  if [ "$INSTALLATION" = yes ] && routed "$1"; then
-    installation_get "$1" "$2.http" "$media" && http_body "$2.http" > "$2" || exit 1
-  else
-    http_get "$1" "$2.http" "$media" && http_body "$2.http" > "$2" || exit 1
-  fi
+  http_get "$1" "$2.http" "$media" && http_body "$2.http" > "$2" || exit 1
   [ "$media" = application/vnd.github.raw+json ] || jq -se 'length == 1' "$2" > /dev/null
 )
 
 # Follow GitHub's next-page link, including after a 304. Cache each page by
 # its full endpoint; the cached response includes its original Link header.
 next_page() {
-  if [ "$INSTALLATION" = yes ]; then
-    next=$(awk '/^\r?$/ { exit } tolower($1) == "x-openwiz-next:" { sub(/^[^:]*:[ ]*/, ""); sub(/\r$/, ""); print; exit }' "$1") \
-      || return 1
-    [ -z "$next" ] || { printf '%s\n' "$next"; return 0; }
-  fi
   link=$(awk 'tolower($1) == "link:" { sub(/^[^:]*:[ ]*/, ""); sub(/\r$/, ""); print }' "$1") || return 1
   case $link in *'rel="next"'*) ;; *) return 0 ;; esac
   next=$(printf '%s\n' "$link" | tr ',' '\n' | sed -n 's/^[ ]*<\([^>]*\)>; *rel="next"[ ]*$/\1/p')
@@ -1286,7 +1198,7 @@ def refused_lately($last; $k): $last != null and ($last.r | test("^" + $k + " (r
 def look($n; $rs; $why): ($why | gsub("\\bthr_[A-Za-z0-9][A-Za-z0-9_-]*"; "[private thread]")) as $why | if any($rs[]; (.r | gsub("\\bthr_[A-Za-z0-9][A-Za-z0-9_-]*"; "[private thread]")) == "look: \($why)") then empty else "look #\($n): \($why)" end;
 
 # A spec'"'"'s approved plan graph: its latest comment that starts
-# "**Plan graph approved by" (the plan-graph skill'"'"'s record): the revision
+# "**Plan graph approved by" (the to-tickets skill'"'"'s record): the revision
 # number, a table with one row per ticket (| #<n> | <title> | <blocked by> |
 # <label> |), and "Fingerprint: <the SHA-256 of the revision text>".
 def approval: (.body | lines) as $ls | ($ls | map(select(test("\\S"))) | first // "" | sub("^\\s+"; "")) as $head
@@ -1299,19 +1211,19 @@ def approval: (.body | lines) as $ls | ($ls | map(select(test("\\S"))) | first /
 def latest($s): [$s.comments.nodes[] | approval] | max_by(.id);
 def subs($s): [$s.subIssues.nodes[].number];
 def row($s): . as $t | [latest($s).rows[]? | select(.number == $t.number)] | first;
-# Current: the latest approval'"'"'s fingerprint is the one plan-graph'"'"'s
+# Current: the latest approval'"'"'s fingerprint is the one to-tickets'"'"'s
 # revision.sh gives the plan now ($W.fingerprints, read only for a spec with a
 # ticket that could start). Anything else is stale: nothing under it starts.
 def current($s): latest($s).fingerprint as $f | $f != null and $f == $W.fingerprints["\($s.number)"];
 def spec_rec($s; $re): any($s | records[]; .r | test($re));
-# The spec'"'"'s fleet thread (ClosedWiz#192, ADR 0011): its latest record
-# "fleet thread <id>, loop <id>", which the fleet thread posts on its spec as it
-# starts, and a new fleet thread posts again as it takes over. Null if none.
-def fleet($s): [($s.comments.nodes // [])[] | {id: .databaseId, at: .createdAt, r: (.body | rec), error: .recordError} | select(.error == null) | . as $c
-  | (.r // "" | capture("^(?:fleet active, loop (?<loop>[A-Za-z0-9_-]+)|fleet thread (?<t>[A-Za-z0-9_][A-Za-z0-9_-]{0,127})(, loop (?<l>[A-Za-z0-9_][A-Za-z0-9_-]{0,127}))?)$"))
-  | {id: $c.id, at: $c.at, thread: (.t // "private fleet"), loop: (.loop // .l)}] | max_by(.id);
-# In a fleet thread'"'"'s check (`spec S`), the fleet thread of spec $s; else null.
-def fleet_of($s): if $s != null and $W.spec == $s.number then fleet($s) else null end;
+# The latest fleet record routes the spec to its loop. Fresh wakes keep the
+# existing assignments, including agents whose records predate the loop.
+def fleet($s): [($s.comments.nodes // [])[] | {id: .databaseId, at: .createdAt, body, error: .recordError} | select(.error == null) | . as $c
+  | ((.body | rec) // "" | capture("^(?:fleet active, loop (?<loop>[A-Za-z0-9_-]+)|fleet thread (?<t>[A-Za-z0-9_][A-Za-z0-9_-]{0,127})(, loop (?<l>[A-Za-z0-9_][A-Za-z0-9_-]{0,127}))?)$"))
+  | {id: $c.id, at: $c.at, thread: (.t // "private fleet"), loop: (.loop // .l),
+     fresh: (.loop != null and ($c.body | split("\n") | index("Wake mode: fresh") != null))}] | max_by(.id);
+# Only a legacy retained fleet thread uses the takeover cutoff.
+def fleet_of($s): if $s != null and $W.spec == $s.number then (fleet($s) | if .fresh then null else . end) else null end;
 # A record last edited before the fleet thread'"'"'s record, or in the same
 # second: the agent it names was started by an earlier fleet thread or tick,
 # so this one can'"'"'t reach it. A tie counts as before: a fleet thread records
@@ -1431,16 +1343,13 @@ def matches($p): . as $f
     elif ($p | contains("*")) then ($f | test("^" + ($p | gsub("(?<c>[.+?^${}()|\\[\\]\\\\])"; "\\\(.c)") | gsub("\\*"; "[^/]*")) + "$"))
     else $f == $p end;
 def cutoff($s): approved_at($s);
-# A merge tied with the approval is not a hit (`hits`), but it is no proof
-# the approval saw it either: the release reads `hits_since($s; true)` (#2112 R7).
-def hits_since($s; $tie): . as $t | cutoff($s) as $c | relies as $ps
+def hits($s): . as $t | cutoff($s) as $c | relies as $ps
   | if $c == null or ($ps | length) == 0 then [] else
-      [$W.merged[] | select(.closes as $cl | (.mergedAt > $c or ($tie and .mergedAt == $c)) and ($t.number | among($cl) | not))
+      [$W.merged[] | select(.closes as $cl | .mergedAt > $c and ($t.number | among($cl) | not))
        | {pr: .number, files: ([.files[] | select(.status != "added") | (.filename, .previous_filename)
            | select(. != null) | select(. as $f | any($ps[]; . as $p | $f | matches($p)))] | unique)}
        | select(.files | length > 0)] | sort_by(.pr) end;
-def hits($s): hits_since($s; false);
-def due_hits($s): records as $rs | [hits($s)[] | .pr as $p | select(any($rs[]; .r | test("^(held for|noted) #\($p)\\b")) | not)];
+def due_notes($s): records as $rs | [hits($s)[] | .pr as $p | select(any($rs[]; .r | test("^(held for|noted) #\($p)\\b")) | not)];
 def held($s): ([records[] | kind("held for") | select(.r | startswith("held for ordering:") | not) | .at] | max) as $h | approved_at($s) as $a
   | $h != null and ($a == null or $h > $a);
 # Every hold comment of any kind, as read: a `held ...` record (contract,
@@ -1455,7 +1364,7 @@ def hold_comments: [.comments.nodes[]
 # A hold of launch-fleet'"'"'s own that a newer approval has released. The held
 # label on the ticket is launch-fleet'"'"'s only when launch-fleet'"'"'s "held for"
 # record is no older than the label'"'"'s latest going on (its timeline): a held
-# label put on later, by plan-graph or anyone, is theirs to take off.
+# label put on later, by to-tickets or anyone, is theirs to take off.
 def held_since: [.timelineItems.nodes[]? | select(.label.name == "held") | .createdAt] | max;
 # The newest unresolved hold of any kind decides, failing closed (#2218): every
 # hold comment since the label last went on must be a contract `held for #<P>`
@@ -1487,14 +1396,9 @@ def ordering_open_claims: . as $t
      | (.h | tonumber) as $id | select($t | ordering_done({id: $id}) | not)
      | {id: $c.databaseId, hold: $id, at: $c.createdAt, edited: ($c.updatedAt // $c.createdAt), r: $r}];
 def ordering_inflight: (ordering_open_claims | length) > 0;
-# #2112 (OB7): an approval answers a contract hold only through a complete,
-# unchanged cutoff. No declared-contract change merged at or since that
-# approval (by either name of a rename, or a deletion; a `noted` record tells a
-# builder but approves nothing), no release claim is unresolved, and the plan
-# is still the one approved. Otherwise the hold stands.
-# Each candidate'"'"'s plan fingerprint is read, as for an ordering release.
-def release_candidate($s): labelled_held and released($s) and (hits_since($s; true) | length) == 0
-  and (ordering_inflight | not);
+# An existing contract hold needs a newer approval, exclusive hold ownership,
+# and no unresolved release claim. The plan fingerprint is checked for each candidate.
+def release_candidate($s): labelled_held and released($s) and (ordering_inflight | not);
 def release_due($s): release_candidate($s)
   and ($s == null or (current($s) and $W.fingerprint_agreement["\($s.number)"] == true));
 # Same ordinary start guards, before requiring a ready label or no held label.
@@ -1504,22 +1408,42 @@ def start_clear($s):
   and all(.blockedBy.nodes[]; blocker_done)
   and start.state == "queued"
   and (open_prs | length) == 0
-  and (held($s) | not)
-  and (due_hits($s) | length) == 0;
+  and (held($s) | not);
 def ready_but_current($s): has_role("ready-for-agent") and start_clear($s)
   and (labelled_held | not) and (ordering_inflight | not);
-def ready($s): ready_but_current($s) and ($s == null or current($s));
+# KN13 (#1448): the text of a ticket is an order only from people the project
+# trusts. The latest labelled event of the ready label must be by a maintainer (a
+# record author, or a collaborator with write access, read only for a ticket
+# that could otherwise start), and the body unedited since, by anyone; else a
+# maintainer must put the label on again. GraphQL names the bot of an App without
+# "[bot]". Who added it can'"'"'t be read (not in the last 20 labelled events,
+# or no actor) refuses too.
+def login_of: if type != "object" or (.login | type) != "string" then null
+  elif .__typename == "Bot" then "\(.login)[bot]" else .login end
+  | if . == null then null else ascii_downcase end;
+def approval_label: $W.labels["ready-for-agent"] as $l | [.timelineItems.nodes[]? | select(.label.name == $l)] | max_by(.createdAt);
+def maintainer: . != null and (among($W.authors) or among($W.writers));
+def approver_why: approval_label as $e | $W.labels["ready-for-agent"] as $l
+  | if $e == null then "who added \($l) can'"'"'t be read"
+    elif ($e.actor | login_of | maintainer | not) then "\($l) was last added at \($e.createdAt) by someone who is not a maintainer"
+    elif .lastEditedAt != null and .lastEditedAt > $e.createdAt then "the ticket was edited at \(.lastEditedAt), after \($l) was added at \($e.createdAt)"
+    # GitHub'"'"'s times are to the second: an edit in the label'"'"'s own second
+    # may have come after it (R1 on WizSkills#67).
+    elif .lastEditedAt != null and .lastEditedAt == $e.createdAt then "the ticket was edited at \(.lastEditedAt), the same second \($l) was added, so which came first can'"'"'t be read"
+    else null end
+  | if . == null then null else "start refused: \(.); a maintainer must add it again" end;
+def ready_unchecked($s): ready_but_current($s) and ($s == null or current($s));
+def ready($s): ready_unchecked($s) and approver_why == null;
 def may_start($s): ready($s) and (refused_lately(start.last; "start") | not);
 # A fleet thread'"'"'s takeover (ClosedWiz#192) starts a builder too, so it keeps
 # every gate of an ordinary start (Sol R1 on #1517): approved and current,
-# ready, no other triage label, its blockers merged, not held, no contract
-# change due. Only the gates a takeover is already past are left out: a
+# ready, no other triage label, its blockers merged and no hold.
+# Only the gates a takeover is already past are left out: a
 # recorded builder and its open pull request.
 def takeover_clear($s): has_role("ready-for-agent")
   and ([has_role("needs-info"), has_role("needs-triage"), has_role("ready-for-human"), has_role("wontfix")] | any | not)
   and all(.blockedBy.nodes[]; blocker_done)
-  and (held($s) | not) and (labelled_held | not) and (ordering_inflight | not)
-  and (due_hits($s) | length) == 0;
+  and (held($s) | not) and (labelled_held | not) and (ordering_inflight | not);
 def takeover_ready($s): takeover_clear($s) and current($s);
 # The orchestrator archived the old builder: "old builder archived, thread <id>".
 def old_archived: any(records[]; .r | test("^old builder archived, (thread |start [0-9]+$)"));
@@ -1673,17 +1597,16 @@ def ticket_lines_now($s): . as $t
     elif (looks | length) > 0 then records as $rs | looks[] | look($t.number; $rs; .)
     elif is_person($s) then
       (if release_due($s) then "release #\(.number): approved again since its hold; take the held label off" else empty end),
-      (due_hits($s)[] | "hold #\($t.number): \(.files | join(", ")) changed in #\(.pr)"),
-      (if has_role("ready-for-human") and (labelled_held | not) and (held($s) | not) and (due_hits($s) | length) == 0
+      (if has_role("ready-for-human") and (labelled_held | not) and (held($s) | not)
           and all(.blockedBy.nodes[]; blocker_done) and (.blockedBy.pageInfo.hasNextPage | not)
           and (any(records[]; .r | test("^told the user\\b")) | not)
        then "person #\(.number): \(.title) (spec #\($s.number)) is ready, and only the user can do it" else empty end)
     else
       ordering_lines($s),
       (if release_due($s) and (ordering_hold == null) then "release #\(.number): approved again since its hold; take the held label off" else empty end),
-      (building as $b | due_hits($s)[]
-        | if $b then "note #\($t.number): \(.files | join(", ")) changed in #\(.pr); tell its builder\($t | bthread)"
-          else "hold #\($t.number): \(.files | join(", ")) changed in #\(.pr)" end),
+      (if building then due_notes($s)[]
+        | "note #\($t.number): \(.files | join(", ")) changed in #\(.pr); tell its builder\($t | bthread)"
+        else empty end),
       (pending_wait as $w
        | if builder == null or $w == null then empty
          else $W.waited["\($w.number)"] as $b | resume_claim($w) as $claim
@@ -1703,7 +1626,10 @@ def ticket_lines_now($s): . as $t
       (start as $st
        | if $st.state == "queued" then
            (if may_start($s) then "start #\(.number): \(.title) (\(where($s))"
-              + (if $st.last then "; retry after \"\($st.last.r)\"" else "" end) + ")" else empty end)
+              + (if $st.last then "; retry after \"\($st.last.r)\"" else "" end) + ")"
+            elif ready_unchecked($s) and (refused_lately(start.last; "start") | not) and approver_why != null then
+              records as $rs | look(.number; $rs; approver_why)
+            else empty end)
          elif $st.state == "claimed" then
            # From the edit that made it a claim: a takeover edits an older record
            # to "starting" (Sol R3 on #1517); a new claim'"'"'s edit is its creation.
@@ -1827,11 +1753,6 @@ def take_over_again($s; $st): records as $rs
       + (if ($br | length) == 1 then "continue branch \($br[0])" else "build it, as it has no branch yet" end)
       + " (its record: comment \($st.last.id); retry after \"\($st.last.r)\")" end;
 def to_builder: test("^(note|resume|reconcile resume|check start|CI failed|findings|merge main in) ");
-# A contract change while the builder is out of the fleet thread'"'"'s reach
-# (Sol R4 on #1517): no builder can be told of it, so it is a hold, as for a
-# ticket with no builder yet, which the user re-approves before the takeover
-# goes on.
-def takeover_holds($s): . as $t | due_hits($s)[] | "hold #\($t.number): \(.files | join(", ")) changed in #\(.pr)";
 def ticket_lines($s):
   (if .state == "OPEN" and is_planned($s) and (looks | length) == 0 then
      .blockedBy.nodes[]? | completion_request
@@ -1839,9 +1760,9 @@ def ticket_lines($s):
   (fleet_of($s) as $f | start as $st
   | if $f != null and .state == "OPEN" and is_approved($s) and (looks | length) == 0
        and ($st.state == "started" or $st.state == "checked") and ($st.rec | inherited($f))
-    then takeover_holds($s), take_over($s; $f; $st.rec), (ticket_lines_now($s) | select(to_builder | not))
+    then take_over($s; $f; $st.rec), (ticket_lines_now($s) | select(to_builder | not))
     elif .state == "OPEN" and is_approved($s) and (looks | length) == 0 and taking_over($s)
-    then takeover_holds($s), take_over_again($s; $st), (ticket_lines_now($s) | select((to_builder or test("^(start|hold) #")) | not))
+    then take_over_again($s; $st), (ticket_lines_now($s) | select((to_builder or startswith("start #")) | not))
     else ticket_lines_now($s) end);
 
 # A spec'"'"'s approval: a look when it lists no tickets, a re-approve when the
@@ -1898,6 +1819,12 @@ def part_lines: . as $s | records as $srs
 
 def candidates: ($W.specs[] as $s | $s.subIssues.nodes[] | select(is_named($s)) | {t: ., s: $s}),
   ($W.singles[] | {t: ., s: null});
+# The users who labelled a ticket that could otherwise start, not record
+# authors: their write access is read (Writer), once each.
+def writers_wanted: [candidates | .s as $s | .t
+  | select(.state == "OPEN" and is_approved($s) and (looks | length) == 0 and ready_unchecked($s))
+  | approval_label | .actor | select(type == "object" and .__typename == "User") | login_of
+  | select(. != null and (among($W.authors) | not))] | unique | .[];
 # Only existing, readable builders can be resumed; this never starts one.
 def waiters: candidates | .s as $s | .t
   | select(.state == "OPEN" and is_approved($s) and (looks | length) == 0 and builder != null)
@@ -1928,7 +1855,7 @@ def wake: [($W.specs | sort_by(.number)[]
 def frontier: [candidates | .s as $s | .t
   | select(.state == "OPEN" and is_approved($s) and (looks | length) == 0 and may_start($s))
   | {number, title}] | unique_by(.number) | .[] | "#\(.number) \(.title)";
-def holds: check | select(test("^(hold|note) "));
+def holds: check | select(startswith("note #"));
 # The claim rule: a tick that posted a claim goes only if no older claim is
 # still live (starting, started, start checked; or for a review, starting,
 # started or re-check sent on the same commit), no builder or pull request is
@@ -1963,6 +1890,7 @@ def claim: $W.claim.n as $n | $W.claim.id as $id
             elif (open_prs | length) > 0 then "withdraw #\($n): pull request #\(open_prs[0].number) is open"
             elif (looks | length) > 0 then "withdraw #\($n): \(looks[0])"
             elif refused_lately($st.last; "start") then "withdraw #\($n): its start was refused less than 10 minutes ago"
+            elif ready_unchecked($s) and approver_why != null then "withdraw #\($n): \(approver_why)"
             elif ready($s) then "go #\($n)"
             else "withdraw #\($n): it is not on the frontier now" end end
     else
@@ -1998,14 +1926,34 @@ jqw() {
 world() {
   jq -n --argjson now "$NOW" --arg default "$DEFAULT" --slurpfile specs "$TMP/specs.json" \
     --slurpfile checks "$1" --slurpfile labels "$2" --slurpfile singles "$3" --arg claim "${CLAIM_N:+$CLAIM_N $CLAIM_ID}" \
-    --slurpfile followups "$TMP/followups.json" --arg spec "${SPEC:-}" \
+    --slurpfile followups "$TMP/followups.json" --arg spec "${SPEC:-}" --slurpfile authors "$TMP/authors.json" \
     '{now: $now, default: $default, specs: $specs[0], singles: $singles[0], checks: $checks[0], labels: $labels[0],
-      followups: $followups[0], spec: (if $spec == "" then null else ($spec | tonumber) end),
+      followups: $followups[0], authors: $authors[0], writers: [], spec: (if $spec == "" then null else ($spec | tonumber) end),
       claim: (if $claim == "" then null else ($claim | split(" ") | {n: (.[0] | tonumber), id: (.[1] | tonumber)}) end),
       fingerprints: {}, branches: {}, merged: [], prfiles: {}}' > "$TMP/world.json" || die "can't build the world"
 }
 
-# unticked_hash FILE: FILE's SHA-256 as plan-graph's revision.sh hashes a body:
+# writers: KN13 (#1448). The write access of each user writers_wanted names,
+# into the world's writers: one small GraphQL read each, only for a ticket
+# that could otherwise start and that no record author labelled. A read that
+# fails or answers anything else grants nothing: that ticket is refused.
+writers() {
+  printf '[]' > "$TMP/writers.json" && jqw 'writers_wanted' > "$TMP/writers-wanted.txt" \
+    || die "can't list who labelled the tickets"
+  while IFS= read -r login; do
+    case $login in '' | -* | *[!a-z0-9-]*) continue ;; esac
+    if ( gql Writer "$TMP/writer.json" -f login="$login" ) 2> /dev/null \
+      && jq -e --arg l "$login" 'any(.data.repository.collaborators.edges[]?; (.node.login | ascii_downcase) == $l
+           and (.permission | IN("ADMIN", "MAINTAIN", "WRITE")))' "$TMP/writer.json" > /dev/null 2>&1; then
+      jq --arg l "$login" '. + [$l]' "$TMP/writers.json" > "$TMP/writers.next" && mv "$TMP/writers.next" "$TMP/writers.json" \
+        || die "can't write"
+    fi
+  done < "$TMP/writers-wanted.txt"
+  jq --slurpfile w "$TMP/writers.json" '.writers = $w[0]' "$TMP/world.json" > "$TMP/world.next" \
+    && mv "$TMP/world.next" "$TMP/world.json" || die "can't write"
+}
+
+# unticked_hash FILE: FILE's SHA-256 as to-tickets’ revision.sh hashes a body:
 # each ticked task box read as unticked, bytes not characters.
 TAB=$(printf '\t') CR=$(printf '\r')
 unticked_hash() {
@@ -2013,7 +1961,7 @@ unticked_hash() {
     -e "s/^([ $TAB]*[-*+][ $TAB]+)\[[xX]\]([ $TAB$CR])/\1[ ]\2/" "$1" | hash
 }
 
-# revision_text SPEC: the revision text plan-graph's revision.sh prints for
+# revision_text SPEC: the revision text to-tickets’ revision.sh prints for
 # SPEC, made from what this check read, the same read as its fingerprint key.
 # A fingerprint is kept only when revision.sh printed exactly this, so a plan
 # edited between the two reads is never cached under the wrong key (Sol R2 on
@@ -2051,7 +1999,7 @@ fingerprint_key() {
 }
 
 # Each spec with a ticket that could start: its plan as it is now, from
-# plan-graph's revision.sh, and that text's SHA-256; or the fingerprint
+# to-tickets’ revision.sh, and that text's SHA-256; or the fingerprint
 # cached for the same key, when nothing revision.sh reads has changed. Only a
 # fingerprint whose revision text is the plan this check read is cached. A
 # read that fails stops the check: nothing starts on a guess.
@@ -2060,8 +2008,8 @@ fingerprints() {
   printf '{' > "$TMP/fingerprints.json" || die "can't write"
   sep=''
   for s in $(sort -n -u "$TMP/to-check.txt"); do
-    [ -f "$REVISION" ] || die "can't find plan-graph's revision.sh at $REVISION, so no approval can be checked"
-    REVISION_SELF=$(hash < "$REVISION") && [ ${#REVISION_SELF} = 64 ] || die "can't hash plan-graph's revision.sh"
+    [ -f "$REVISION" ] || die "can't find to-tickets’ revision.sh at $REVISION, so no approval can be checked"
+    REVISION_SELF=$(hash < "$REVISION") && [ ${#REVISION_SELF} = 64 ] || die "can't hash to-tickets’ revision.sh"
     k='' f='' agreed=false
     [ -z "$CACHE" ] || k=$(fingerprint_key "$s") || k=''
     if [ ${#k} = 64 ]; then
@@ -2073,7 +2021,7 @@ fingerprints() {
     if [ ${#f} != 64 ]; then
       [ -z "$REPLAY" ] || die "the saved full read has no fingerprint for #$s"
       LAUNCH_FLEET_ASKED=$TMP/asked-revision sh "$REVISION" "$s" > "$TMP/revision-$s.txt" \
-        || die "plan-graph's revision.sh failed on #$s, so its approval can't be checked"
+        || die "to-tickets’ revision.sh failed on #$s, so its approval can't be checked"
       f=$(hash < "$TMP/revision-$s.txt") || die "can't hash the revision of #$s"
       case $f in *[!0-9a-f]* | '') die "can't hash the revision of #$s" ;; esac
       [ ${#f} = 64 ] || die "can't hash the revision of #$s"
@@ -2506,13 +2454,9 @@ else
   singles
 fi
 world "$TMP/checks.json" "$TMP/labels.json" "$TMP/singles.json"
-# Installation privacy must be read successfully. Legacy gh failures mean public.
-# No API body is echoed.
+# A gh failure means public. No API body is echoed.
 if [ -n "$REPLAY" ]; then
   private=$(cat "$REPLAY/snap/private")
-elif [ "$INSTALLATION" = yes ]; then
-  private=$(rest "repos/$REPO" "$TMP/repository-rest.json" && jq -r '.private == true' "$TMP/repository-rest.json" 2> /dev/null) \
-    || die "can't read the repository's privacy through the installation"
 else
   private=$(gh repo view --json isPrivate --jq .isPrivate 2>/dev/null) || private=false
 fi
@@ -2521,7 +2465,7 @@ python3 "$(dirname "$0")/records.py" "$REPO" "$private" < "$TMP/world.json" > "$
   && mv "$TMP/resolved.json" "$TMP/world.json" || die "can't resolve fleet records"
 case $cmd in check | wake | spec | every) branches; waits ;; claim) waits ;; esac
 merges
-[ "$cmd" = holds ] || fingerprints
+[ "$cmd" = holds ] || { fingerprints; writers; }
 jqw "$cmd" > "$TMP/out.txt" || die "can't work out what is due"
 case $(head -n 1 "$TMP/out.txt") in error\ *) die "$(head -n 1 "$TMP/out.txt" | cut -c7-)" ;; esac
 if grep -q '^guard #' "$TMP/out.txt"; then
