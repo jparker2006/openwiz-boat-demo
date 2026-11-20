@@ -5,3 +5,4 @@
 | Setting | Value |
 | --- | --- |
 | Record authors | `openwiz[bot]`, `jparker2006` |
+| Harness permission mode | `bypassPermissions` |
